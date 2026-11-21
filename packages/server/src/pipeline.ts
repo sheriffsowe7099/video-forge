@@ -14,17 +14,18 @@
  *   the worker only processes scenes whose clip file is missing.
  */
 
-import { mkdir, rm } from 'node:fs/promises';
+import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
   captionsToVtt,
   parseCaptionText,
   type Project,
+  type ProjectOutputMetadata,
   type RenderJob,
   type Scene,
 } from '@video-forge/shared';
-import type { GenerationProvider, ProviderCapabilities } from './providers/provider.js';
-import { ProviderError } from './providers/provider.js';
+import { type GenerationProvider, type ProviderCapabilities, ProviderError } from './providers/provider.js';
+import { dimensionsFor } from './providers/comfyui.js';
 import { Storage } from './storage.js';
 import { runAssembly, isFFmpegAvailable, FFmpegError } from './ffmpeg.js';
 import type { JobStore } from './jobstore.js';
@@ -50,18 +51,14 @@ export class RenderPipeline {
     this.provider = deps.provider;
     this.storage = deps.storage;
     this.jobStore = deps.jobStore;
-    this.concurrency = deps.concurrency ?? 1;
+    this.concurrency = Math.max(1, deps.concurrency ?? 1);
   }
 
-  isRunning(jobId: string): boolean {
-    return this.activeJobs.has(jobId);
-  }
-
-  /** Start a render job for the project. Returns the job id. */
+  /** Start a render job for the project. Duplicate submissions return the active job. */
   async start(project: Project): Promise<RenderJob> {
-    const existingActive = await this.findActiveJob(project.id);
+    const existingActive = this.findActiveJob(project.id);
     if (existingActive !== undefined) {
-      return existingActive; // Prevent duplicate submission (double click).
+      return existingActive; // Prevents double-submission (double clicks, retries).
     }
 
     const job: RenderJob = {
@@ -76,7 +73,6 @@ export class RenderPipeline {
       output: null,
     };
     await this.jobStore.createJob(job);
-    // Fire and forget; status flows through the job store.
     void this.run(job.id, project.id).catch((err: unknown) => {
       void this.jobStore.updateJob(job.id, (j) => ({
         ...j,
@@ -101,9 +97,10 @@ export class RenderPipeline {
     return this.jobStore.requestCancel(jobId);
   }
 
-  private async findActiveJob(projectId: string): Promise<RenderJob | undefined> {
-    const jobs = this.jobStore.listJobsForProject(projectId);
-    return jobs.find((j) => j.status === 'queued' || j.status === 'running');
+  private findActiveJob(projectId: string): RenderJob | undefined {
+    return this.jobStore
+      .listJobsForProject(projectId)
+      .find((j) => j.status === 'queued' || j.status === 'running');
   }
 
   private async run(jobId: string, projectId: string): Promise<void> {
@@ -120,23 +117,26 @@ export class RenderPipeline {
         throw new ProviderError('unavailable', caps.unavailableReason ?? 'Generation backend is not available.');
       }
 
-      await this.jobStore.updateJob(jobId, (j) => ({ ...j, status: 'running', startedAt: new Date().toISOString() }));
-      await this.jobStore.updateProject(projectId, (p) => ({
-        ...p,
-        status: 'generating',
+      await this.jobStore.updateJob(jobId, (j) => ({
+        ...j,
+        status: 'running',
+        startedAt: new Date().toISOString(),
       }));
+      await this.jobStore.updateProject(projectId, (p) => ({ ...p, status: 'generating' }));
 
-      // Queue scenes needing generation (missing clip file).
-      const pendingScenes = project.scenes.filter((s) => !(s.outputKey !== null && (await this.storage.exists(s.outputKey))));
-      const queue = [...pendingScenes];
-      let succeeded = 0;
-      let failed = 0;
+      // Only scenes whose clip file is missing get generated; succeeded
+      // scenes are never regenerated on retry.
+      const queue: Scene[] = [];
+      for (const scene of project.scenes) {
+        const hasClip = scene.outputKey !== null && (await this.storage.exists(scene.outputKey));
+        if (!hasClip) {
+          queue.push(scene);
+        }
+      }
 
       const sceneDurations = project.scenes.map((s) => s.durationSeconds);
-
-      // Process scenes with bounded concurrency.
-      const workers: Promise<void>[] = [];
       const nextScene = (): Scene | undefined => queue.shift();
+
       const runWorker = async (): Promise<void> => {
         for (;;) {
           const scene = nextScene();
@@ -145,18 +145,17 @@ export class RenderPipeline {
           }
           const jobNow = this.jobStore.getJob(jobId);
           if (jobNow?.cancelRequested === true) {
-            await this.updateSceneStatus(projectId, scene.id, (s) => ({ ...s, status: 'canceled', progress: null }));
+            await this.updateSceneStatus(projectId, scene.id, (s) => ({
+              ...s,
+              status: 'canceled',
+              progress: null,
+            }));
             return;
           }
-          await this.generateScene(projectId, jobId, scene, caps, controller.signal);
-          const sceneAfter = this.jobStore.getProject(projectId)?.scenes.find((s) => s.id === scene.id);
-          if (sceneAfter?.status === 'succeeded') {
-            succeeded++;
-          } else if (sceneAfter?.status === 'failed') {
-            failed++;
-          }
+          await this.generateScene(projectId, scene, caps, controller.signal);
         }
       };
+      const workers: Promise<void>[] = [];
       for (let i = 0; i < this.concurrency; i++) {
         workers.push(runWorker());
       }
@@ -173,27 +172,30 @@ export class RenderPipeline {
       if (fresh === undefined) {
         throw new Error('Project disappeared during generation.');
       }
-      const allSucceeded = fresh.scenes.every(
-        (s) => s.outputKey !== null && this.storage.exists(s.outputKey) !== undefined && true,
-      );
-      // Re-check existence synchronously for correctness:
-      let missing = 0;
+
+      // Verify every scene has a real clip file before assembling.
+      const missingScenes: string[] = [];
       for (const s of fresh.scenes) {
         if (s.outputKey === null || !(await this.storage.exists(s.outputKey))) {
-          missing++;
+          missingScenes.push(s.id);
         }
       }
-      if (missing > 0) {
+      if (missingScenes.length > 0) {
         const anyFailed = fresh.scenes.some((s) => s.status === 'failed');
-        await this.finishJob(jobId, 'failed', anyFailed ? 'Some scenes failed to generate. Retry failed scenes from the storyboard.' : 'Some scene clips are missing.');
+        await this.finishJob(
+          jobId,
+          'failed',
+          anyFailed
+            ? 'Some scenes failed to generate. Open the storyboard and retry the failed scenes; successful scenes are kept.'
+            : 'Some scene clips are missing.',
+        );
         await this.jobStore.updateProject(projectId, (p) => ({ ...p, status: 'failed' }));
         return;
       }
-      void allSucceeded;
 
       // Assemble.
       await this.jobStore.updateProject(projectId, (p) => ({ ...p, status: 'assembling' }));
-      const output = await this.assemble(fresh, jobId, sceneDurations);
+      const output = await this.assemble(fresh, sceneDurations);
       await this.jobStore.updateProject(projectId, (p) => ({
         ...p,
         status: 'completed',
@@ -208,7 +210,6 @@ export class RenderPipeline {
 
   private async generateScene(
     projectId: string,
-    jobId: string,
     scene: Scene,
     caps: ProviderCapabilities,
     signal: AbortSignal,
@@ -222,32 +223,42 @@ export class RenderPipeline {
     }));
     const clipKey = `projects/${projectId}/clips/${scene.id}.mp4`;
     const clipPath = this.storage.resolveKey(clipKey);
-    const refImage =
-      scene.referenceImage !== null ? this.storage.resolveKey(scene.referenceImage.storageKey) : null;
     const project = this.jobStore.getProject(projectId);
-    const seed = project?.settings.seed !== null && caps.supportsSeed ? (project?.settings.seed ?? null) : null;
+    const refImage =
+      scene.referenceImage !== null
+        ? this.storage.resolveKey(scene.referenceImage.storageKey)
+        : null;
+    const settings = project?.settings;
+    const seed = settings !== undefined && settings.seed !== null && caps.supportsSeed ? settings.seed : null;
 
-    let lastError: ProviderError | Error = new Error('unknown');
+    let lastError: Error = new Error('unknown error');
     for (let attempt = 0; attempt <= MAX_SCENE_RETRIES; attempt++) {
       if (signal.aborted) {
-        await this.updateSceneStatus(projectId, scene.id, (s) => ({ ...s, status: 'canceled', progress: null }));
+        await this.updateSceneStatus(projectId, scene.id, (s) => ({
+          ...s,
+          status: 'canceled',
+          progress: null,
+        }));
         return;
       }
       try {
         await this.provider.generate(
           {
             prompt: scene.prompt,
-            negativePrompt: project?.settings.negativePrompt ?? '',
+            negativePrompt: settings?.negativePrompt ?? '',
             durationSeconds: scene.durationSeconds,
-            height: project?.settings.outputHeight ?? 768,
-            aspectRatio: project?.settings.aspectRatio ?? '16:9',
+            height: settings?.outputHeight ?? 768,
+            aspectRatio: settings?.aspectRatio ?? '16:9',
             seed,
             referenceImagePath: refImage,
             outputClipPath: clipPath,
           },
           (event) => {
             if (event.progress !== null) {
-              void this.updateSceneStatus(projectId, scene.id, (s) => ({ ...s, progress: event.progress }));
+              void this.updateSceneStatus(projectId, scene.id, (s) => ({
+                ...s,
+                progress: event.progress,
+              }));
             }
           },
           signal,
@@ -265,12 +276,16 @@ export class RenderPipeline {
         return;
       } catch (err) {
         if (signal.aborted) {
-          await this.updateSceneStatus(projectId, scene.id, (s) => ({ ...s, status: 'canceled', progress: null }));
+          await this.updateSceneStatus(projectId, scene.id, (s) => ({
+            ...s,
+            status: 'canceled',
+            progress: null,
+          }));
           return;
         }
         lastError = err instanceof Error ? err : new Error(String(err));
         if (err instanceof ProviderError && err.kind === 'invalid-input') {
-          break; // Do not retry invalid inputs.
+          break; // Invalid input will not succeed on retry.
         }
         await sleep(1000 * (attempt + 1));
       }
@@ -281,36 +296,37 @@ export class RenderPipeline {
       progress: null,
       error: lastError.message,
     }));
-    void jobId;
   }
 
   private async assemble(
     project: Project,
-    jobId: string,
     sceneDurations: number[],
-  ): Promise<ProjectOutputLike> {
+  ): Promise<ProjectOutputMetadata> {
     const ffmpegOk = await isFFmpegAvailable();
     if (!ffmpegOk) {
-      throw new FFmpegError(null, 'FFmpeg is not installed or not on PATH. Install FFmpeg to assemble clips (see README).');
+      throw new FFmpegError(
+        null,
+        'FFmpeg is not installed or not on PATH. Install FFmpeg to assemble clips (see README).',
+      );
     }
     const workDir = this.storage.resolveKey(`projects/${project.id}/work`);
     await mkdir(workDir, { recursive: true });
 
-    const { dimensionsFor } = await import('./providers/comfyui.js');
     const dims = dimensionsFor(project.settings.outputHeight, project.settings.aspectRatio);
 
-    // Captions.
+    // Captions: write VTT; burn in only if requested.
     let subtitlesPath: string | null = null;
     const captionLines = parseCaptionText(project.settings.captions.text);
-    if (captionLines.length > 0 && project.settings.captions.burnIn) {
+    if (captionLines.some((l) => l.length > 0) && project.settings.captions.burnIn) {
       const vtt = captionsToVtt(captionLines, sceneDurations);
-      subtitlesPath = join(workDir, 'captions.vtt');
       await this.storage.write(`projects/${project.id}/work/captions.vtt`, vtt);
+      subtitlesPath = join(workDir, 'captions.vtt');
     }
 
-    const musicPath = project.settings.audio.musicKey !== null
-      ? this.storage.resolveKey(project.settings.audio.musicKey)
-      : null;
+    const musicPath =
+      project.settings.audio.musicKey !== null
+        ? this.storage.resolveKey(project.settings.audio.musicKey)
+        : null;
 
     const clipPaths = project.scenes
       .slice()
@@ -329,7 +345,6 @@ export class RenderPipeline {
         subtitlesPath,
         musicPath,
         masterVolume: project.settings.audio.masterVolume,
-        mp3Volume: undefined,
         musicVolume: project.settings.audio.musicVolume,
         musicFadeIn: project.settings.audio.musicFadeIn,
         musicFadeOut: project.settings.audio.musicFadeOut,
@@ -340,10 +355,9 @@ export class RenderPipeline {
     );
 
     const sizeBytes = await this.storage.size(outputKey);
-    void jobId;
     return {
       storageKey: outputKey,
-      fileName: `${sanitize(project.title)}.mp4`,
+      fileName: `${sanitizeFileName(project.title)}.mp4`,
       format: 'mp4',
       codec: 'h264 (libx264)',
       durationSeconds: project.settings.totalDurationSeconds,
@@ -370,22 +384,27 @@ export class RenderPipeline {
       ...j,
       status,
       error,
-      finishedAt: new Date().toISOString(),
+      finishedAt: status === 'queued' ? j.finishedAt : new Date().toISOString(),
     }));
   }
 }
 
-type ProjectOutputLike = {
-  storageKey: string;
-  fileName: string;
-  format: string;
-  codec: string;
-  durationSeconds: number;
-  width: number;
-  height: number;
-  sizeBytes: number;
-  producedAt: string;
-};
+/** Cleanup old completed projects per retention policy. Documented in README. */
+export async function cleanupOldProjects(
+  jobStore: JobStore,
+  storage: Storage,
+  maxAgeDays: number,
+): Promise<number> {
+  const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
+  let removed = 0;
+  for (const project of jobStore.listProjects()) {
+    if (project.status === 'completed' && Date.parse(project.updatedAt) < cutoff) {
+      await storage.remove(`projects/${project.id}`);
+      removed++;
+    }
+  }
+  return removed;
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
@@ -393,20 +412,6 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
-function sanitize(name: string): string {
+function sanitizeFileName(name: string): string {
   return name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80);
-}
-
-/** Cleanup old outputs per retention policy. Documented in README. */
-export async function cleanupOldProjects(jobStore: JobStore, storage: Storage, maxAgeDays: number): Promise<number> {
-  const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
-  let removed = 0;
-  for (const project of jobStore.listProjects()) {
-    const ageOk = Date.parse(project.updatedAt) < cutoff;
-    if (ageOk && project.status === 'completed') {
-      await storage.remove(`projects/${project.id}`);
-      removed++;
-    }
-  }
-  return removed;
 }
