@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { Project } from '@video-forge/shared';
-import { api, type BackendHealth } from './api.js';
-import { Dashboard } from './components/Dashboard.jsx';
-import { ProjectEditor } from './components/ProjectEditor.jsx';
-import { Settings } from './components/Settings.jsx';
+import { api, type BackendHealth } from './api';
+import { Dashboard } from './components/Dashboard';
+import { ProjectEditor } from './components/ProjectEditor';
+import { Settings } from './components/Settings';
 
 type View = { kind: 'dashboard' } | { kind: 'project'; id: string } | { kind: 'settings' };
 
@@ -79,11 +79,8 @@ export function App() {
         {health !== null && !health.backend.available && (
           <div className="notice">
             <strong>Generation backend not configured.</strong> You can create and edit projects, but videos
-            cannot be generated until you connect a self-hosted backend (see{' '}
-            <a href="https://github.com/sheriffsowe7099/video-forge#connecting-a-generation-backend" target="_blank" rel="noreferrer">
-              the README
-            </a>{' '}
-            or the “Backend status” page). Nothing is fabricated while the backend is unavailable.
+            cannot be generated until you connect a self-hosted backend (see the “Backend status” page or the
+            repository README). Nothing is fabricated while the backend is unavailable.
           </div>
         )}
 
