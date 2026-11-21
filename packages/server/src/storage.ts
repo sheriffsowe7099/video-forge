@@ -11,7 +11,7 @@
  */
 
 import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
-import { join, normalize, resolve, sep } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 
 export class PathTraversalError extends Error {
   constructor() {
@@ -70,17 +70,13 @@ export class Storage {
   }
 
   async remove(key: string): Promise<void> {
-    const abs = this.resolveKey(resolveKeySafe(key));
+    const abs = this.resolveKey(key);
     await rm(abs, { force: true, recursive: true });
   }
 
   rootPath(): string {
     return this.root;
   }
-}
-
-function resolveKeySafe(key: string): string {
-  return key;
 }
 
 function dirname(p: string): string {
@@ -101,9 +97,4 @@ export function sanitizeFileName(name: string): string {
 /** Escape a value for use in an ffmpeg filter string. */
 export function escapeFilterValue(value: string): string {
   return value.replace(/([\\':])/g, '\\$1');
-}
-
-/** Prevent double-quoting issues in ffmpeg drawtext fontfile paths. */
-export function normalize(p: string): string {
-  return p;
 }
