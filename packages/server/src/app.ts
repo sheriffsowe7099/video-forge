@@ -3,21 +3,17 @@
  *
  * Security notes:
  * - All request bodies are validated server-side before use.
- * - Files are stored privately; download/preview go through /api/projects/:id/media
- *   which resolves storage keys server-side.
+ * - Files are stored privately; media access goes through
+ *   /api/projects/:id/media/* which resolves keys server-side.
  * - No secrets are returned to clients. Prompts are not logged.
  * - Single-trusted-user deployment by default (see README security section).
  * - JSON error responses include only readable messages, no stack traces.
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
-  type AspectRatio,
   type Project,
-  type ProjectOutputMetadata,
-  type ProjectSettings,
   type Scene,
   planStoryboard,
   reorderScenes,
@@ -29,10 +25,12 @@ import {
   validateTitle,
   ALLOWED_IMAGE_MIME_TYPES,
   MAX_IMAGE_BYTES,
+  parseCaptionText,
+  captionsToVtt,
 } from '@video-forge/shared';
 import { createProviderFromEnv, NodeEnv } from './providers/factory.js';
 import { RenderPipeline } from './pipeline.js';
-import { Storage, sanitizeFileName } from './storage.js';
+import { Storage } from './storage.js';
 import { JobStore } from './jobstore.js';
 import { isFFmpegAvailable } from './ffmpeg.js';
 
@@ -56,22 +54,38 @@ export function loadConfig(env: NodeJS.ProcessEnv): ServerConfig {
   };
 }
 
+class HttpError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'HttpError';
+    this.status = status;
+  }
+}
+
+function bad(status: number, message: string): never {
+  throw new HttpError(status, message);
+}
+
+export interface AppContext {
+  config: ServerConfig;
+  storage: Storage;
+  jobStore: JobStore;
+  pipeline: RenderPipeline;
+  provider: ReturnType<typeof createProviderFromEnv>;
+}
+
 export function createApp(config: ServerConfig) {
   const storage = new Storage(config.dataDir);
   const jobStore = new JobStore(join(config.dataDir, 'state'));
   const provider = createProviderFromEnv(new NodeEnv());
-  const pipeline = new RenderPipeline({
-    provider,
-    storage,
-    jobStore,
-    concurrency: 1,
-  });
+  const pipeline = new RenderPipeline({ provider, storage, jobStore, concurrency: 1 });
 
   const server = createServer(async (req, res) => {
     try {
       await route(req, res, { config, storage, jobStore, provider, pipeline });
     } catch (err) {
-      if (err instanceof PathDenied) {
+      if (err instanceof HttpError) {
         sendJson(res, err.status, { error: err.message });
         return;
       }
@@ -83,27 +97,10 @@ export function createApp(config: ServerConfig) {
   return { server, storage, jobStore, provider, pipeline, config };
 }
 
-class PathDenied extends Error {
-  readonly status: number;
-  constructor(status: number, message: string) {
-    super(message);
-    this.status = status;
-  }
-}
-
-interface Ctx {
-  config: ServerConfig;
-  storage: Storage;
-  jobStore: JobStore;
-  provider: ReturnType<typeof createProviderFromEnv>;
-  pipeline: RenderPipeline;
-}
-
-async function route(req: IncomingMessage, res: ServerResponse, ctx: Ctx): Promise<void> {
+async function route(req: IncomingMessage, res: ServerResponse, ctx: AppContext): Promise<void> {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const parts = url.pathname.split('/').filter((p) => p.length > 0);
 
-  // OPTIONS for dev CORS (same-origin in production; document proxying).
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'access-control-allow-origin': '*',
@@ -114,7 +111,6 @@ async function route(req: IncomingMessage, res: ServerResponse, ctx: Ctx): Promi
     return;
   }
 
-  // Health/status: honest backend reporting.
   if (req.method === 'GET' && url.pathname === '/api/health') {
     const caps = await ctx.provider.capabilities();
     const ffmpeg = await isFFmpegAvailable();
@@ -137,43 +133,39 @@ async function route(req: IncomingMessage, res: ServerResponse, ctx: Ctx): Promi
     return;
   }
 
-  if (parts[0] !== 'api') {
+  if (parts[0] !== 'api' || parts[1] !== 'projects') {
     sendJson(res, 404, { error: 'Not found.' });
     return;
   }
-
-  // /api/projects
-  if (parts[1] === 'projects') {
-    await routeProjects(req, res, ctx, url, parts);
-    return;
-  }
-
-  sendJson(res, 404, { error: 'Unknown endpoint.' });
+  await routeProjects(req, res, ctx, parts);
 }
 
 async function routeProjects(
   req: IncomingMessage,
   res: ServerResponse,
-  ctx: Ctx,
-  url: URL,
+  ctx: AppContext,
   parts: string[],
 ): Promise<void> {
-  // POST /api/projects — create
+  // POST /api/projects — create project (plans storyboard)
   if (req.method === 'POST' && parts.length === 2) {
     const body = await readJson(req, 1_000_000);
     const title = validateTitle(body.title);
-    if (!title.ok) throw new PathDenied(400, title.error!);
+    if (!title.ok) bad(400, title.error!);
     const mode = validateMode(body.mode);
-    if (!mode.ok) throw new PathDenied(400, mode.error!);
+    if (!mode.ok) bad(400, mode.error!);
     const prompt = validatePrompt(body.prompt);
-    if (!prompt.ok) throw new PathDenied(400, prompt.error!);
+    if (!prompt.ok) bad(400, prompt.error!);
     const caps = await ctx.provider.capabilities();
-    const settingsResult = validateProjectSettings(body.settings ?? {}, caps.supportedHeights, caps.supportedClipDurations);
-    if (!settingsResult.ok) throw new PathDenied(400, settingsResult.error!);
+    const settingsResult = validateProjectSettings(
+      body.settings ?? {},
+      caps.supportedHeights,
+      caps.supportedClipDurations,
+    );
+    if (!settingsResult.ok) bad(400, settingsResult.error!);
     const settings = settingsResult.value!;
 
     if (mode.value === 'image-to-video' && !caps.supportsImageToVideo) {
-      throw new PathDenied(
+      bad(
         400,
         'The configured backend does not support image-to-video. Use text-to-video, or configure an image-to-video backend (see README).',
       );
@@ -185,12 +177,7 @@ async function routeProjects(
       mode: mode.value!,
       prompt: prompt.value!,
       settings,
-      scenes: planStoryboard({
-        mode: mode.value!,
-        prompt: prompt.value!,
-        settings,
-        referenceImageName: null,
-      }),
+      scenes: planStoryboard({ mode: mode.value!, prompt: prompt.value!, settings, referenceImageName: null }),
       status: 'draft',
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -202,7 +189,7 @@ async function routeProjects(
     return;
   }
 
-  // GET /api/projects — list
+  // GET /api/projects
   if (req.method === 'GET' && parts.length === 2) {
     sendJson(res, 200, ctx.jobStore.listProjects());
     return;
@@ -210,11 +197,11 @@ async function routeProjects(
 
   const projectId = parts[2];
   if (projectId === undefined || !/^[a-zA-Z0-9-]+$/.test(projectId)) {
-    throw new PathDenied(404, 'Project not found.');
+    bad(404, 'Project not found.');
   }
   const project = ctx.jobStore.getProject(projectId);
   if (project === undefined) {
-    throw new PathDenied(404, 'Project not found.');
+    bad(404, 'Project not found.');
   }
 
   // GET /api/projects/:id
@@ -233,13 +220,17 @@ async function routeProjects(
 
   // POST /api/projects/:id/duplicate
   if (req.method === 'POST' && parts.length === 4 && parts[3] === 'duplicate') {
-    const copy = await ctx.jobStore.duplicateProject(projectId, crypto.randomUUID(), `${project.title} (copy)`);
-    if (copy === undefined) throw new PathDenied(404, 'Project not found.');
+    const copy = await ctx.jobStore.duplicateProject(
+      projectId,
+      crypto.randomUUID(),
+      `${project.title} (copy)`,
+    );
+    if (copy === undefined) bad(404, 'Project not found.');
     sendJson(res, 201, copy);
     return;
   }
 
-  // PUT /api/projects/:id — update title/prompt/settings (replans storyboard when settings change)
+  // PUT /api/projects/:id — update title/prompt/settings
   if (req.method === 'PUT' && parts.length === 3) {
     const body = await readJson(req, 1_000_000);
     const caps = await ctx.provider.capabilities();
@@ -247,17 +238,17 @@ async function routeProjects(
       const next = { ...p };
       if (body.title !== undefined) {
         const title = validateTitle(body.title);
-        if (!title.ok) throw new PathDenied(400, title.error!);
+        if (!title.ok) bad(400, title.error!);
         next.title = title.value!;
       }
       if (body.settings !== undefined) {
         const result = validateProjectSettings(body.settings, caps.supportedHeights, caps.supportedClipDurations);
-        if (!result.ok) throw new  PathDenied(400, result.error!);
+        if (!result.ok) bad(400, result.error!);
         next.settings = result.value!;
       }
       if (body.prompt !== undefined) {
         const prompt = validatePrompt(body.prompt);
-        if (!prompt.ok) throw new PathDenied(400, prompt.error!);
+        if (!prompt.ok) bad(400, prompt.error!);
         next.prompt = prompt.value!;
       }
       const samePlan =
@@ -267,7 +258,6 @@ async function routeProjects(
           next.settings.clipDurationSeconds === p.settings.clipDurationSeconds &&
           next.settings.style === p.settings.style);
       if (!samePlan) {
-        // Replan only if plan-shape changed; keep already generated clips aligned by order.
         next.scenes = planStoryboard({
           mode: next.mode,
           prompt: next.prompt,
@@ -277,25 +267,24 @@ async function routeProjects(
       }
       return next;
     });
-    if (updated === undefined) throw new  PathDenied(404, 'Project not found.');
+    if (updated === undefined) bad(404, 'Project not found.');
     sendJson(res, 200, updated);
     return;
   }
 
-  // ---- Scenes ----
+  // ---- Scene editing ----
 
-  // PUT /api/projects/:id/scenes/:sceneId — edit scene prompt/duration/referenceImage
+  // PUT /api/projects/:id/scenes/:sceneId
   if (req.method === 'PUT' && parts.length === 5 && parts[3] === 'scenes') {
     const sceneId = parts[4]!;
     const body = await readJson(req, 200_000);
     const updated = await ctx.jobStore.updateProject(projectId, (p) => {
       const idx = p.scenes.findIndex((s) => s.id === sceneId);
-      if (idx === -1) throw new PathDenied(404, 'Scene not found.');
-      const scene = p.scenes[idx]!;
-      const next: Scene = { ...scene };
+      if (idx === -1) bad(404, 'Scene not found.');
+      const next: Scene = { ...p.scenes[idx]! };
       if (body.prompt !== undefined) {
         const prompt = validatePrompt(body.prompt);
-        if (!prompt.ok) throw new PathDenied(400, prompt.error!);
+        if (!prompt.ok) bad(400, prompt.error!);
         next.prompt = prompt.value!;
       }
       if (body.durationSeconds !== undefined) {
@@ -305,7 +294,7 @@ async function routeProjects(
           body.durationSeconds < 1 ||
           body.durationSeconds > 20
         ) {
-          throw new PathDenied(400, 'Scene duration must be a whole number of seconds between 1 and 20.');
+          bad(400, 'Scene duration must be a whole number of seconds between 1 and 20.');
         }
         next.durationSeconds = body.durationSeconds;
         next.status = 'pending';
@@ -315,13 +304,11 @@ async function routeProjects(
         p.scenes.map((s) => (s.id === sceneId ? next.durationSeconds : s.durationSeconds)),
         p.settings.totalDurationSeconds,
       );
-      if (durationError !== null) {
-        throw new PathDenied(400, durationError);
-      }
+      if (durationError !== null) bad(400, durationError);
       p.scenes[idx] = next;
       return p;
     });
-    if (updated === undefined) throw new PathDenied(404, 'Project not found.');
+    if (updated === undefined) bad(404, 'Project not found.');
     sendJson(res, 200, updated);
     return;
   }
@@ -332,10 +319,10 @@ async function routeProjects(
     const caps = await ctx.provider.capabilities();
     const updated = await ctx.jobStore.updateProject(projectId, (p) => {
       if (p.scenes.length >= 40) {
-        throw new PathDenied(400, 'This project already has the maximum of 40 scenes.');
+        bad(400, 'This project already has the maximum of 40 scenes.');
       }
       if (typeof body.prompt !== 'string' || body.prompt.trim().length === 0) {
-        throw new PathDenied(400, 'Scene prompt is required.');
+        bad(400, 'Scene prompt is required.');
       }
       if (
         typeof body.durationSeconds !== 'number' ||
@@ -343,16 +330,20 @@ async function routeProjects(
         body.durationSeconds < 1 ||
         !caps.supportedClipDurations.includes(body.durationSeconds)
       ) {
-        throw new PathDenied(
+        bad(
           400,
           `Scene duration must be one of the backend-supported clip durations: ${caps.supportedClipDurations.join(', ')}s.`,
         );
       }
-      const newTotal = p.scenes.reduce((a, s) => a + s.durationSeconds, 0) + body.durationSeconds;
+      const newTotal =
+        p.scenes.reduce((a, s) => a + s.durationSeconds, 0) + body.durationSeconds;
       if (newTotal > p.settings.totalDurationSeconds) {
-        raise(400, `Adding this scene would exceed the project target duration (${p.settings.totalDurationSeconds}s). Remove duration from other scenes or raise the target.`);
+        bad(
+          400,
+          `Adding this scene would exceed the project target duration (${p.settings.totalDurationSeconds}s). Shorten other scenes or raise the target.`,
+        );
       }
-      const scene: Scene = {
+      p.scenes.push({
         id: crypto.randomUUID(),
         order: p.scenes.length,
         prompt: body.prompt.trim(),
@@ -360,15 +351,13 @@ async function routeProjects(
         referenceImage: null,
         status: 'pending',
         progress: null,
-        generateKey: undefined as never,
         outputKey: null,
         error: '',
         attempts: 0,
-      };
-      p.scenes.push(scene);
+      });
       return p;
     });
-    if (updated === undefined) throw new PathDenied(404, 'Project not found.');
+    if (updated === undefined) bad(404, 'Project not found.');
     sendJson(res, 201, updated);
     return;
   }
@@ -378,21 +367,37 @@ async function routeProjects(
     const sceneId = parts[4]!;
     const updated = await ctx.jobStore.updateProject(projectId, (p) => {
       const idx = p.scenes.findIndex((s) => s.id === sceneId);
-      if (idx === -1) throw new PathDenied(404, 'Scene not found.');
+      if (idx === -1) bad(404, 'Scene not found.');
       p.scenes.splice(idx, 1);
       p.scenes = p.scenes.map((s, i) => ({ ...s, order: i }));
       return p;
     });
-    if (updated === undefined) throw new PathDenied(404, 'Project not found.');
+    if (updated === undefined) bad(404, 'Project not found.');
     sendJson(res, 200, updated);
     return;
   }
 
-  // POST /api/projects/:id/scenes/:sceneId/regenerate — reset + queue just this scene
+  // POST /api/projects/:id/scenes/reorder
+  if (req.method === 'POST' && parts.length === 5 && parts[3] === 'scenes' && parts[4] === 'reorder') {
+    const body = await readJson(req, 200_000);
+    const updated = await ctx.jobStore.updateProject(projectId, (p) => {
+      if (typeof body.from !== 'number' || typeof body.to !== 'number') {
+        bad(400, 'from and to must be numbers.');
+      }
+      p.scenes = reorderScenes(p.scenes, body.from, body.to);
+      return p;
+    });
+    if (updated === undefined) bad(404, 'Project not found.');
+    sendJson(res, 200, updated);
+    return;
+  }
+
+  // POST /api/projects/:id/scenes/:sceneId/regenerate
   if (req.method === 'POST' && parts.length === 6 && parts[3] === 'scenes' && parts[5] === 'regenerate') {
     const sceneId = parts[4]!;
-    const scene = project.scenes.find((s) => s.id === sceneId);
-    if (scene === undefined) throw new PathDen(404, 'Scene not found.');
+    if (!project.scenes.some((s) => s.id === sceneId)) {
+      bad(404, 'Scene not found.');
+    }
     await ctx.jobStore.updateProject(projectId, (p) => ({
       ...p,
       scenes: p.scenes.map((s) =>
@@ -404,31 +409,18 @@ async function routeProjects(
     const fresh = ctx.jobStore.getProject(projectId)!;
     const job = await ctx.pipeline.start(fresh);
     sendJson(res, 202, job);
-    returns;
-  }
-
-  // POST /api/projects/:id/scenes/reorder
-  if (req.method === 'POST' && parts.length === 5 && parts[3] === 'scenes' && parts[4] === 'reorder') {
-    const body = await readJson(req, 200_000);
-    const updated = await ctx.jobStore.updateProject(projectId, (p) => {
-      if (typeof body.from !== 'number' || typeof body.to !== 'number') {
-        throw new PathDenied(400, 'from and to must be numbers.');
-      }
-      p.scenes = reorderScenes(p.scenes, body.from, body.to);
-      return p;
-    });
-    if (updated === undefined) throw new PathDenied(404, 'Project not found.');
-    sendJson(res, 200, updated);
     return;
   }
 
   // POST /api/projects/:id/start — submit render job (idempotent per active job)
   if (req.method === 'POST' && parts.length === 4 && parts[3] === 'start') {
-    const activeJobs = ctx.jobStore.listJobsForProject(projectId).filter((j) => j.status === 'queued' || j.status === 'running');
-    if (activeJobs.length >= ctx.config.maxConcurrentJobs) {
-      throw new PathDenied(
+    const active = ctx.jobStore
+      .listJobsForProject(projectId)
+      .filter((j) => j.status === 'queued' || j.status === 'running');
+    if (active.length > 0) {
+      bad(
         409,
-        `A render job is already active for this project. This prevents duplicate submissions; wait for it to finish or cancel it.`,
+        'A render job is already active for this project. Wait for it to finish or cancel it first (duplicate submissions are blocked).',
       );
     }
     const job = await ctx.pipeline.start(project);
@@ -436,15 +428,17 @@ async function routeProjects(
     return;
   }
 
-  // GET /api/projects/:id/jobs — job history
+  // GET /api/projects/:id/jobs
   if (req.method === 'GET' && parts.length === 4 && parts[3] === 'jobs') {
     sendJson(res, 200, ctx.jobStore.listJobsForProject(projectId));
     return;
   }
 
-  // POST /api/projects/:id/cancel — request cancellation
+  // POST /api/projects/:id/cancel
   if (req.method === 'POST' && parts.length === 4 && parts[3] === 'cancel') {
-    const jobs = ctx.jobStore.listJobsForProject(projectId).filter((j) => j.status === 'queued' || j.status === 'running');
+    const jobs = ctx.jobStore
+      .listJobsForProject(projectId)
+      .filter((j) => j.status === 'queued' || j.status === 'running');
     if (jobs.length === 0) {
       sendJson(res, 200, { ok: false, message: 'No active job to cancel.' });
       return;
@@ -456,10 +450,10 @@ async function routeProjects(
     return;
   }
 
-  // GET /api/projects/:id/output — download/preview the final video
+  // GET /api/projects/:id/output — final video preview/download
   if (req.method === 'GET' && parts.length === 4 && parts[3] === 'output') {
     if (project.outputKey === null) {
-      throw new PathDenied(404, 'This project has no output yet.');
+      bad(404, 'This project has no output yet.');
     }
     const buffer = await ctx.storage.read(project.outputKey);
     res.writeHead(200, {
@@ -471,7 +465,7 @@ async function routeProjects(
     return;
   }
 
-  // GET /api/projects/:id/captions.vtt — sidecar captions export
+  // GET /api/projects/:id/captions.vtt
   if (req.method === 'GET' && parts.length === 4 && parts[3] === 'captions.vtt') {
     const lines = parseCaptionText(project.settings.captions.text);
     const vtt = captionsToVtt(lines, project.scenes.map((s) => s.durationSeconds));
@@ -484,15 +478,18 @@ async function routeProjects(
   if (req.method === 'POST' && parts.length === 5 && parts[3] === 'upload' && parts[4] === 'image') {
     const contentType = req.headers['content-type'] ?? '';
     if (!ALLOWED_IMAGE_MIME_TYPES.includes(contentType)) {
-      throw new PathDenied(415, `Unsupported image type. Allowed: ${ALLOWED_IMAGE_MIME_TYPES.join(', ')}.`);
+      bad(415, `Unsupported image type. Allowed: ${ALLOWED_IMAGE_MIME_TYPES.join(', ')}.`);
     }
     const declaredSize = Number(req.headers['content-length'] ?? '0');
     if (declaredSize > ctx.config.maxUploadBytes) {
-      throw new PathDenied(413, `Image exceeds the upload limit (${Math.floor(ctx.config.maxUploadBytes / 1024 / 1024)} MiB).`);
+      bad(
+        413,
+        `Image exceeds the upload limit (${Math.floor(ctx.config.maxUploadBytes / 1024 / 1024)} MiB).`,
+      );
     }
     const bytes = await readBody(req, ctx.config.maxUploadBytes);
     const check = validateImageMime(contentType, bytes.length);
-    if (!check.ok) throw new PathDenied(400, check.error!);
+    if (!check.ok) bad(400, check.error!);
     const ext = contentType === 'image/png' ? 'png' : contentType === 'image/jpeg' ? 'jpg' : 'webp';
     const key = `projects/${projectId}/uploads/ref-${crypto.randomUUID()}.${ext}`;
     await ctx.storage.write(key, bytes);
@@ -500,28 +497,74 @@ async function routeProjects(
     return;
   }
 
-  // GET /api/projects/:id/media/:key — private media access (server-resolved)
+  // GET /api/projects/:id/media/:key — private media access (project-scoped)
   if (req.method === 'GET' && parts.length === 5 && parts[3] === 'media') {
     const key = decodeURIComponent(parts[4]!);
-    // Only allow keys under this project.
     if (!key.startsWith(`projects/${projectId}/`)) {
-      throw new PathDenied(403, 'Forbidden: media belongs to another project.');
+      bad(403, 'Forbidden: media belongs to another project.');
     }
     const buffer = await ctx.storage.read(key);
-    const mime = mimeFor(key);
     res.writeHead(200, {
-      'content-type': mime,
+      'content-type': mimeFor(key),
       'content-length': String(buffer.byteLength),
     });
     res.end(buffer);
     return;
   }
 
-  throw new PathDenied(404, 'Unknown endpoint.');
+  bad(404, 'Unknown endpoint.');
 }
 
-function raise(status: number, message: string): never {
-  throw new PathDenied(status, message);
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  const json = JSON.stringify(body);
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'access-control-allow-origin': '*',
+  });
+  res.end(json);
 }
 
-class PathDenied extends Error {}
+async function readJson(req: IncomingMessage, limit: number): Promise<Record<string, unknown>> {
+  const bytes = await readBody(req, limit);
+  if (bytes.byteLength === 0) return {};
+  try {
+    return JSON.parse(bytes.toString('utf8')) as Record<string, unknown>;
+  } catch {
+    bad(400, 'Request body must be valid JSON.');
+  }
+}
+
+function readBody(req: IncomingMessage, limit: number): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let received = 0;
+    req.on('data', (chunk: Buffer) => {
+      received += chunk.byteLength;
+      if (received > limit) {
+        reject(new HttpError(413, 'Request body exceeds the size limit.'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', (err) => reject(err));
+  });
+}
+
+function mimeFor(key: string): string {
+  if (key.endsWith('.mp4')) return 'video/mp4';
+  if (key.endsWith('.png')) return 'image/png';
+  if (key.endsWith('.jpg') || key.endsWith('.jpeg')) return 'image/jpeg';
+  if (key.endsWith('.webp')) return 'image/webp';
+  if (key.endsWith('.vtt')) return 'text/vtt; charset=utf-8';
+  if (key.endsWith('.mp3') || key.endsWith('.wav') || key.endsWith('.ogg') || key.endsWith('.flac')) {
+    return 'audio/mpeg';
+  }
+  return 'application/octet-stream';
+}
+
+function intOr(value: string | undefined, fallback: number): number {
+  const n = Number(value);
+  return Number.isInteger(n) && n > 0 ? n : fallback;
+}
