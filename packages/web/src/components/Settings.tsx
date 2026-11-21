@@ -1,4 +1,4 @@
-import { api, type BackendHealth } from '../api.js';
+import { api, type BackendHealth } from '../api';
 
 interface Props {
   health: BackendHealth | null;
