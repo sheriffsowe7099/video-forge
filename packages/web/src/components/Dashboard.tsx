@@ -1,6 +1,6 @@
 import type { Project } from '@video-forge/shared';
-import type { BackendHealth } from '../api.js';
-import { NewProjectForm } from './NewProjectForm.jsx';
+import type { BackendHealth } from '../api';
+import { NewProjectForm } from './NewProjectForm';
 
 interface Props {
   health: BackendHealth | null;
@@ -52,8 +52,7 @@ export function Dashboard({ health, projects, projectsError, onOpen, onRefreshPr
                   {p.title}
                 </button>
                 <p className="hint">
-                  {p.mode} · {p.settings.totalDurationSeconds}s · {p.scenes.length} scenes ·{' '}
-                  <span className={`scene-status ${p.status}`}>{p.status}</span>
+                  {p.mode} · {p.settings.totalDurationSeconds}s · {p.scenes.length} scenes
                 </p>
               </div>
               <span className={`scene-status ${p.status}`}>{p.status}</span>
