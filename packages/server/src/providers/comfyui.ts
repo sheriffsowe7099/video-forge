@@ -4,19 +4,20 @@
  * Adapter for a self-hosted ComfyUI instance (https://github.com/comfyanonymous/ComfyUI)
  * exposing its HTTP API on localhost. Model-specific workflow JSON is
  * NOT hard-coded here: the user supplies a workflow template file per
- * mode (see README) whose LoadCheckpoint/CLIPTextEncode nodes receive
- * the prompt, and whose image nodes receive the reference image.
+ * mode (see README) whose prompt nodes receive the scene text, and whose
+ * image node receives the reference image.
  *
- * The provider reads the workflow from disk, patches prompt/dimension
- * fields, queues it, polls history, and downloads the resulting video
- * file. Failures map to honest ProviderError kinds.
+ * The provider loads the workflow template from disk, patches prompt /
+ * dimension / seed fields, uploads a reference image when needed, queues
+ * the workflow, polls history, and downloads the resulting video file.
+ * Failures map to honest ProviderError kinds.
  *
- * This is a best-effort adapter: ComfyUI workflow graphs vary wildly
- * by model. Read the README section "Connecting ComfyUI" before use.
+ * Note: ComfyUI workflow graphs vary by model. Read the README section
+ * "Connecting ComfyUI" before use.
  */
 
-import { mkdir, writeFile } from 'node:fs/promises';
-import { basename } from 'node:path';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { basename, dirname } from 'node:path';
 import {
   type GenerationProvider,
   type GenerateRequest,
@@ -25,7 +26,6 @@ import {
   ProviderError,
 } from './provider.js';
 
-/** Default ComfyUI API surface (no trailing slash). */
 const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000; // generous: diffusion is slow
 
 export interface ComfyUIProviderOptions {
@@ -35,7 +35,7 @@ export interface ComfyUIProviderOptions {
   textWorkflowPath: string;
   /** Path to a workflow template JSON for image-to-video (optional). */
   imageWorkflowPath: string | null;
-  /** Node ids inside the workflow that receive the prompt. */
+  /** Node id inside the workflow that receives the positive prompt. */
   promptNodeId: string;
   /** Node id that receives the negative prompt (optional). */
   negativeNodeId: string | null;
@@ -79,9 +79,6 @@ export class ComfyUIProvider implements GenerationProvider {
       name: 'ComfyUI (self-hosted)',
       available: true,
       unavailableReason: null,
-      // These are enforced by app validation: the workflow must be able
-      // to produce these; the user asserts them via env config. The UI
-      // shows them as "configured values", not detected facts.
       supportedHeights: [512, 640, 768],
       supportedClipDurations: [4, 6, 8],
       supportsImageToVideo: this.opts.imageWorkflowPath !== null && this.opts.imageNodeId !== null,
@@ -120,16 +117,11 @@ export class ComfyUIProvider implements GenerationProvider {
       );
     }
 
-    // Load workflow template.
     let workflowText: string;
     try {
-      workflowText = await Bun.file(workflowPath).text();
+      workflowText = await readFile(workflowPath, 'utf8');
     } catch {
-      try {
-        workflowText = (await import('node:fs/promises')).readFile(workflowPath, 'utf8');
-      } catch {
-        throw new ProviderError('invalid-input', `Cannot read workflow template at ${workflowPath}. Fix the VF_COMFY_*_WORKFLOW path.`);
-      }
+      throw new ProviderError('invalid-input', `Cannot read workflow template at ${workflowPath}. Fix the VF_COMFY_*_WORKFLOW path.`);
     }
 
     let workflow: Record<string, unknown>;
@@ -140,42 +132,24 @@ export class ComfyUIProvider implements GenerationProvider {
     }
 
     // Upload reference image first (image-to-video).
-    let uploadName: string | null = null;
     if (usingImage && this.opts.imageNodeId !== null) {
-      uploadName = await this.uploadImage(request.referenceImagePath!, signal);
-      const imageNode = (workflow as Record<string, Record<string, unknown>>)[this.opts.imageNodeId];
-      if (imageNode !== undefined) {
-        imageNode.inputs = {
-          ...(imageNode.inputs as Record<string, unknown>),
-          image: uploadName,
-        };
-      }
+      const uploadName = await this.uploadImage(request.referenceImagePath as string, signal);
+      this.patchNode(workflow, this.opts.imageNodeId, 'image', uploadName);
     }
 
-    // Patch prompt fields.
-    const patch = (nodeId: string | null, key: string, value: unknown): void => {
-      if (nodeId === null) return;
-      const nodes = workflow as Record<string, Record<string, unknown>>;
-      const node = nodes[nodeId];
-      if (node === undefined) return;
-      const inputs = (node.inputs ?? {}) as Record<string, unknown>;
-      inputs[key] = value;
-      node.inputs = inputs;
-    };
-    patch(this.opts.promptNodeId, 'text', request.prompt);
+    this.patchNode(workflow, this.opts.promptNodeId, 'text', request.prompt);
     if (this.opts.negativeNodeId !== null) {
-      patch(this.opts.negativeNodeId, 'text', request.negativePrompt);
+      this.patchNode(workflow, this.opts.negativeNodeId, 'text', request.negativePrompt);
     }
-    const { width, height } = dimensionsFor(request.height, request.aspectRatio);
+    const dims = dimensionsFor(request.height, request.aspectRatio);
     if (this.opts.dimensionNodeId !== null) {
-      patch(this.opts.dimensionNodeId, 'width', width);
-      patch(this.opts.dimensionNodeId, 'height', height);
+      this.patchNode(workflow, this.opts.dimensionNodeId, 'width', dims.width);
+      this.patchNode(workflow, this.opts.dimensionNodeId, 'height', dims.height);
     }
     if (request.seed !== null && this.opts.seedNodeId !== null) {
-      patch(this.opts.seedNodeId, 'seed', request.seed);
+      this.patchNode(workflow, this.opts.seedNodeId, 'seed', request.seed);
     }
 
-    // Queue the prompt and poll history until complete.
     const queueRes = await fetch(`${this.opts.baseUrl}/prompt`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -216,17 +190,18 @@ export class ComfyUIProvider implements GenerationProvider {
           history = body[promptId] ?? null;
         }
       } catch (err) {
-        if (signal.aborted) throw new ProviderError('unavailable', 'Generation canceled.');
+        if (signal.aborted) {
+          throw new ProviderError('unavailable', 'Generation canceled.');
+        }
         throw new ProviderError('unavailable', `Lost connection to ComfyUI while generating: ${describeError(err)}`);
       }
-      if (history === null) continue;
-      const status = history.status?.status_str;
-      if (status === 'error') {
+      if (history === null) {
+        continue;
+      }
+      if (history.status?.status_str === 'error') {
         throw new ProviderError('server-error', 'ComfyUI reported an execution error for this scene. Check the ComfyUI server console for details.');
       }
-      const outputs = history.outputs ?? {};
-      const outputEntry = outputs[this.opts.outputNodeId];
-      const video = outputEntry?.videos?.[0];
+      const video = history.outputs?.[this.opts.outputNodeId]?.videos?.[0];
       if (video !== undefined) {
         await this.downloadVideo(video, request.outputClipPath, signal);
         return;
@@ -235,20 +210,30 @@ export class ComfyUIProvider implements GenerationProvider {
     throw new ProviderError('timeout', 'Generation timed out after 20 minutes for this scene. The backend may be overloaded or the model too slow for this clip length.');
   }
 
+  private patchNode(
+    workflow: Record<string, unknown>,
+    nodeId: string,
+    key: string,
+    value: unknown,
+  ): void {
+    const nodes = workflow as Record<string, { inputs?: Record<string, unknown> }>;
+    const node = nodes[nodeId];
+    if (node === undefined) {
+      return;
+    }
+    node.inputs = { ...(node.inputs ?? {}), [key]: value };
+  }
+
   private async uploadImage(imagePath: string, signal: AbortSignal): Promise<string> {
-    let bytes: ArrayBuffer;
+    let bytes: Buffer;
     try {
-      bytes = await Bun.file(imagePath).arrayBuffer();
+      bytes = await readFile(imagePath);
     } catch {
-      try {
-        bytes = (await (await import('node:fs/promises')).readFile(imagePath)).buffer;
-      } catch {
-        throw new ProviderError('invalid-input', 'Cannot read the uploaded reference image from storage.');
-      }
+      throw new ProviderError('invalid-input', 'Cannot read the uploaded reference image from storage.');
     }
     const name = basename(imagePath);
     const form = new FormData();
-    form.append('image', new Blob([bytes]), name);
+    form.append('image', new Blob([new Uint8Array(bytes)]), name);
     const res = await fetch(`${this.opts.baseUrl}/upload/image`, {
       method: 'POST',
       body: form,
@@ -272,8 +257,12 @@ export class ComfyUIProvider implements GenerationProvider {
     signal: AbortSignal,
   ): Promise<void> {
     const params = new URLSearchParams({ filename: video.filename });
-    if (video.subfolder !== undefined) params.set('subfolder', video.subfolder);
-    if (video.type !== undefined) params.set('type', video.type);
+    if (video.subfolder !== undefined) {
+      params.set('subfolder', video.subfolder);
+    }
+    if (video.type !== undefined) {
+      params.set('type', video.type);
+    }
     const res = await fetch(`${this.opts.baseUrl}/view?${params.toString()}`, {
       signal,
     }).catch((err: unknown) => {
@@ -291,8 +280,12 @@ export class ComfyUIProvider implements GenerationProvider {
   }
 }
 
-function dimensionsFor(height: number, aspectRatio: '16:9' | '9:16' | '1:1'): { width: number; height: number } {
-  switch (aspectRatio)) {
+/** Derive even-dimension width/height for an aspect ratio (H.264 needs even numbers). */
+export function dimensionsFor(
+  height: number,
+  aspectRatio: '16:9' | '9:16' | '1:1',
+): { width: number; height: number } {
+  switch (aspectRatio) {
     case '16:9':
       return { width: roundEven((height * 16) / 9), height: roundEven(height) };
     case '9:16':
@@ -309,7 +302,9 @@ function roundEven(n: number): number {
 }
 
 function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 function describeError(err: unknown): string {
@@ -321,9 +316,4 @@ function describeError(err: unknown): string {
 
 function truncate(s: string): string {
   return s.length > 300 ? `${s.slice(0, 300)}...` : s;
-}
-
-function dirname(p: string): string {
-  const idx = p.lastIndexOf('/');
-  return idx === -1 ? '.' : p.slice(0, idx);
 }
