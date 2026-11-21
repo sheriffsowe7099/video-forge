@@ -39,7 +39,7 @@ export interface PlanRequest {
   mode: GenerationMode;
   prompt: string;
   settings: ProjectSettings;
-  /** Reference image description for image-to-video (used in scene 0 prompt only). */
+  /** Reference image name for image-to-video (used in scene 0 prompt only). */
   referenceImageName: string | null;
 }
 
@@ -49,8 +49,9 @@ export function segmentPrompt(prompt: string, sceneCount: number): string[] {
   if (normalized.length === 0) {
     return Array.from({ length: sceneCount }, () => '');
   }
-  // Split on sentence boundaries; fall back to splitting on commas, then words.
-  let segments: string[] = normalized.split(/(?<=[.!?])\s+/).filter((s) => s.trim().length > 0);
+  let segments: string[] = normalized
+    .split(/(?<=[.!?])\s+/)
+    .filter((s) => s.trim().length > 0);
   if (segments.length < sceneCount) {
     const byComma = normalized.split(/,\s*/).filter((s) => s.trim().length > 0);
     if (byComma.length > segments.length) {
@@ -60,14 +61,21 @@ export function segmentPrompt(prompt: string, sceneCount: number): string[] {
   if (segments.length === 0) {
     segments = [normalized];
   }
-  // Interleave segments across scenes cyclically when there are more scenes
-  // than segments; split the longest segment when there are fewer.
   while (segments.length < sceneCount) {
-    const longestIdx = segments.reduce((max, s, i) => (s.length > segments[max]!.length ? i : max), 0);
+    const longestIdx = segments.reduce(
+      (max, s, i) => (s.length > segments[max]!.length ? i : max),
+      0,
+    );
     const longest = segments[longestIdx]!;
     const mid = Math.floor(longest.length / 2);
-    const cut = longest.lastIndexOf(' ', Math.max(1, mid)) !== -1 ? longest.lastIndexOf(' ', Math.max(1, mid)) : mid;
-    segments.splice(longestIdx, 1, longest.slice(0, cut).trim(), longest.slice(cut).trim());
+    const lastSpace = longest.lastIndexOf(' ', Math.max(1, mid));
+    const cut = lastSpace > 0 ? lastSpace : mid;
+    segments.splice(
+      longestIdx,
+      1,
+      longest.slice(0, cut).trim(),
+      longest.slice(cut).trim(),
+    );
   }
   return segments.slice(0, sceneCount);
 }
@@ -87,18 +95,17 @@ export function planStoryboard(request: PlanRequest): Scene[] {
     const camera = CAMERA_MOVES[i % CAMERA_MOVES.length]!;
     const mood = MOODS[i % MOODS.length]!;
     const parts: string[] = [];
-    if (i === 0 && mode === 'image-to-video' && request.referenceImageName) {
+    if (i === 0 && mode === 'image-to-video' && request.referenceImageName !== null) {
       parts.push(`Animate the uploaded image (${request.referenceImageName}): ${segment}`);
+    } else if (segment === '') {
+      parts.push(prompt);
     } else {
-      parts.push(segment === '' ? `${prompt}` : segment);
+      parts.push(segment);
     }
     parts.push(camera);
     parts.push(mood);
     if (settings.style.trim() !== '') {
       parts.push(settings.style.trim());
-    }
-    if (settings.negativePrompt.trim() !== '') {
-      // Negative prompt is sent separately by the provider; not embedded here.
     }
     scenes.push({
       id: crypto.randomUUID(),
@@ -116,7 +123,7 @@ export function planStoryboard(request: PlanRequest): Scene[] {
   return scenes;
 }
 
-/** Format caption text (one line per scene) into WebVTT cue list. */
+/** Format caption text (one line per scene) into a WebVTT cue list. */
 export function captionsToVtt(
   captionLines: string[],
   sceneDurations: number[],
@@ -125,8 +132,11 @@ export function captionsToVtt(
   let start = 0;
   for (let i = 0; i < captionLines.length; i++) {
     const line = captionLines[i]?.trim() ?? '';
-    if (line.length === 0) continue;
     const duration = sceneDurations[i] ?? 1;
+    if (line.length === 0) {
+      start += duration;
+      continue;
+    }
     const end = start + duration;
     cues.push(`${formatVttTimestamp(start)} --> ${formatVttTimestamp(end)}`);
     cues.push(line);
@@ -139,7 +149,7 @@ export function captionsToVtt(
 function formatVttTimestamp(totalSeconds: number): string {
   const hours = Math.floor(totalSeconds / 3600);
   const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds %  burned: number;
+  const seconds = totalSeconds % 60;
   const h = String(hours).padStart(2, '0');
   const m = String(minutes).padStart(2, '0');
   const s = String(seconds).padStart(2, '0');
@@ -157,7 +167,7 @@ export function reorderScenes(scenes: Scene[], from: number, to: number): Scene[
   return next.map((s, i) => ({ ...s, order: i }));
 }
 
-/** Parse one line per scene caption text into lines. */
+/** Parse one-line-per-scene caption text into an array of lines. */
 export function parseCaptionText(text: string): string[] {
-  return text.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0 ? true : true).map((l) => l);
+  return text.split(/\r?\n/).map((l) => l.trim());
 }
