@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { Project, RenderJob, Scene } from '@video-forge/shared';
-import { api, type BackendHealth } from '../api.js';
+import type { Project, Scene } from '@video-forge/shared';
+import { api, type BackendHealth } from '../api';
 
 interface Props {
   projectId: string;
@@ -46,7 +46,7 @@ export function ProjectEditor({ projectId, health, onBack }: Props) {
   }, [project?.status, refresh]);
 
   async function withBusy(action: () => Promise<void>): Promise<void> {
-    if (busy) return;
+    if (busy) return; // Guard against double submission.
     setBusy(true);
     setActionError(null);
     try {
@@ -91,9 +91,8 @@ export function ProjectEditor({ projectId, health, onBack }: Props) {
               className="btn secondary"
               disabled={busy}
               onClick={() => void withBusy(async () => {
-                const copy = await api.duplicateProject(project.id);
+                await api.duplicateProject(project.id);
                 onBack();
-                void copy;
               })}
             >
               Duplicate
@@ -115,9 +114,6 @@ export function ProjectEditor({ projectId, health, onBack }: Props) {
           {project.mode} · target {project.settings.totalDurationSeconds}s · {project.scenes.length} scenes ·{' '}
           planned {totalPlanned}s{' '}
           {durationMatches ? '✓' : <span className="error-text">✗ (scene durations must sum to the target)</span>}
-        </p>
-        <p className="hint">
-          Mode: {project.mode === 'image-to-video' ? 'image + prompt → video' : 'prompt → video'}
         </p>
       </section>
 
@@ -184,7 +180,7 @@ export function ProjectEditor({ projectId, health, onBack }: Props) {
             <span className="sr-only">Generating scenes. Progress is indeterminate until scenes complete.</span>
           </div>
         )}
-        {!health?.backend.supportsProgress && backendAvailable && jobActive && (
+        {backendAvailable && jobActive && health?.backend.supportsProgress !== true && (
           <p className="hint">
             This backend does not report fractional progress, so an indeterminate indicator is shown rather
             than an invented percentage. Each scene updates as it finishes.
