@@ -1,32 +1,16 @@
 import { useState } from 'react';
 import type { Project, GenerationMode, ProjectSettings } from '@video-forge/shared';
-import { api, type BackendHealth } from '../api.js';
-
-const DEFAULT_SETTINGS: ProjectSettings = {
-  totalDurationSeconds: 24,
-  aspectRatio: '16:9',
-  outputHeight: 768,
-  style: '',
-  sceneCount: 4,
-  clipDurationSeconds: 6,
-  seed: null,
-  negativePrompt: '',
-  transition: 'cut',
-  captions: { text: '', burnIn: false, exportSidecar: false },
-  audio: {
-    muted: false,
-    masterVolume: 1,
-    musicVolume: 0.5,
-    musicFadeIn: 0,
-    musicFadeOut: 2,
-    musicKey: null,
-  },
-};
+import { api, type BackendHealth } from '../api';
 
 interface Props {
   health: BackendHealth | null;
   onCreated: (id: string) => void;
 }
+
+const DURATION_MIN = 5;
+const DURATION_MAX = 300;
+const SCENE_MIN = 1;
+const SCENE_MAX = 40;
 
 export function NewProjectForm({ health, onCreated }: Props) {
   const [title, setTitle] = useState('');
@@ -34,6 +18,7 @@ export function NewProjectForm({ health, onCreated }: Props) {
   const [prompt, setPrompt] = useState('');
   const [totalDuration, setTotalDuration] = useState(24);
   const [aspectRatio, setAspectRatio] = useState<ProjectSettings['aspectRatio']>('16:9');
+  const [outputHeight, setOutputHeight] = useState(768);
   const [sceneCount, setSceneCount] = useState(4);
   const [clipDuration, setClipDuration] = useState(6);
   const [style, setStyle] = useState('');
@@ -44,6 +29,10 @@ export function NewProjectForm({ health, onCreated }: Props) {
   const supportedClips = health?.backend.supportedClipDurations ?? [4, 6, 8];
   const backendAvailable = health?.backend.available === true;
   const imageSupported = health?.backend.supportsImageToVideo === true;
+
+  const effectiveHeight = supportedHeights.includes(outputHeight)
+    ? outputHeight
+    : (supportedHeights[0] ?? 768);
 
   async function handleSubmit(event: React.FormEvent): Promise<void> {
     event.preventDefault();
@@ -56,12 +45,24 @@ export function NewProjectForm({ health, onCreated }: Props) {
         mode,
         prompt,
         settings: {
-          ...DEFAULT_SETTINGS,
           totalDurationSeconds: totalDuration,
           aspectRatio,
+          outputHeight: effectiveHeight,
+          style,
           sceneCount,
           clipDurationSeconds: clipDuration,
-          style,
+          seed: null,
+          negativePrompt: '',
+          transition: 'cut',
+          captions: { text: '', burnIn: false, exportSidecar: false },
+          audio: {
+            muted: false,
+            masterVolume: 1,
+            musicVolume: 0.5,
+            musicFadeIn: 0,
+            musicFadeOut: 2,
+            musicKey: null,
+          },
         },
       });
       onCreated(project.id);
@@ -94,7 +95,6 @@ export function NewProjectForm({ health, onCreated }: Props) {
               id="np-mode"
               value={mode}
               onChange={(e) => setMode(e.target.value as GenerationMode)}
-              disabled={!imageSupported && mode === 'image-to-video'}
             >
               <option value="text-to-video">Text-to-video</option>
               <option value="image-to-video" disabled={!imageSupported}>
@@ -125,8 +125,8 @@ export function NewProjectForm({ health, onCreated }: Props) {
             <input
               id="np-duration"
               type="number"
-              min={5}
-              max={300}
+              min={DURATION_MIN}
+              max={DURATION_MAX}
               step={1}
               value={totalDuration}
               onChange={(e) => setTotalDuration(Number(e.target.value))}
@@ -142,8 +142,8 @@ export function NewProjectForm({ health, onCreated }: Props) {
             <input
               id="np-scenes"
               type="number"
-              min={1}
-              max={40}
+              min={SCENE_MIN}
+              max={SCENE_MAX}
               step={1}
               value={sceneCount}
               onChange={(e) => setSceneCount(Number(e.target.value))}
@@ -178,6 +178,21 @@ export function NewProjectForm({ health, onCreated }: Props) {
             <p className="hint">Only durations your configured backend supports are offered.</p>
           </div>
           <div className="field">
+            <label htmlFor="np-height">Output resolution</label>
+            <select
+              id="np-height"
+              value={effectiveHeight}
+              onChange={(e) => setOutputHeight(Number(e.target.value))}
+            >
+              {supportedHeights.map((h) => (
+                <option key={h} value={h}>
+                  {h}p
+                </option>
+              ))}
+            </select>
+            <p className="hint">Only resolutions your backend supports are listed.</p>
+          </div>
+          <div className="field">
             <label htmlFor="np-style">Style direction (optional)</label>
             <input
               id="np-style"
@@ -188,26 +203,12 @@ export function NewProjectForm({ health, onCreated }: Props) {
               maxLength={200}
             />
           </div>
-          <div className="field">
-            <label htmlFor="np-height">Output resolution</label>
-            <select
-              id="np-height"
-              value={supportedHeights.includes(DEFAULT_SETTINGS.outputHeight) ? DEFAULT_SETTINGS.outputHeight : supportedHeights[0]}
-              onChange={(e) => setDefaultHeight(Number(e.target.value))}
-            >
-              {supportedHeights.map((h) => (
-                <option key={h} value={h}>
-                  {h}p
-                </option>
-              ))}
-            </select>
-            <p className="hint">Only resolutions your backend supports are listed.</p>
-          </div>
         </div>
 
         <div className="notice info">
-          Generation runs on your own self-hosted backend and requires your own GPU/compute. Nothing is
-          sent to any external service. {!backendAvailable && 'Right now no backend is configured — you can prepare the storyboard, but generation will be refused.'}
+          Generation runs on your own self-hosted backend and requires your own GPU/compute. Nothing is sent
+          to any external service.{' '}
+          {!backendAvailable && 'Right now no backend is configured — you can prepare the storyboard, but generation will be refused.'}
         </div>
 
         {error !== null && (
@@ -222,12 +223,4 @@ export function NewProjectForm({ health, onCreated }: Props) {
       </form>
     </section>
   );
-
-  function setDefaultHeight(h: number): void {
-    DEFAULT_SETTINGS.outputHeight = h;
-    // Force re-render since DEFAULT_SETTINGS is a module-level object.
-    setTick((t) => t + 1);
-  }
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const [, setTick] = useState(0);
 }
