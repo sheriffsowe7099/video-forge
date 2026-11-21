@@ -7,10 +7,11 @@
   "types": "src/index.ts",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --no-warnings --test src/**/*.test.ts"
+    "test": "tsx --test src/duration.test.ts src/validation.test.ts src/planner.test.ts"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
+    "tsx": "^4.19.0",
     "typescript": "^5.5.4"
   }
 }
